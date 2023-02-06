@@ -176,6 +176,11 @@ func loadLicenses() *database {
 		if len(header.Name) <= 6 {
 			continue
 		}
+
+		if header.Name == "./App-s2p.txt" {
+			continue
+		}
+
 		key := header.Name[2 : len(header.Name)-4]
 		text := make([]byte, header.Size)
 		readSize, readErr := archive.Read(text)
