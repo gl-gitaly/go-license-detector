@@ -42,6 +42,8 @@ type database struct {
 
 	// license name -> text
 	licenseTexts map[string]string
+	// GPLv2 reference terms without the optional application guide.
+	licenseTextsWithoutApplicationGuide map[string]string
 	// minimum license text length
 	minLicenseLength int
 	// official license URL -> id
@@ -169,6 +171,7 @@ func loadLicenses() *database {
 	tarStream := bytes.NewBuffer(tarBytes)
 	archive := tar.NewReader(tarStream)
 	db.licenseTexts = map[string]string{}
+	db.licenseTextsWithoutApplicationGuide = map[string]string{}
 	tokenFreqs := map[string]map[string]int{}
 	firstLineWriter := &bytes.Buffer{}
 	firstLineWriter.WriteString("(^|\\n)((.*licen[cs]e\\n\\n)|(")
@@ -195,6 +198,9 @@ func loadLicenses() *database {
 			db.minLicenseLength = len(normedText)
 		}
 		db.licenseTexts[key] = normedText
+		if terms := gpl2WithoutApplicationGuide(key, normedText); terms != "" {
+			db.licenseTextsWithoutApplicationGuide[key] = terms
+		}
 		newLinePos := strings.Index(normedText, "\n")
 		if newLinePos >= 0 {
 			firstLineWriter.WriteString(regexp.QuoteMeta(normedText[:newLinePos]))
@@ -374,45 +380,12 @@ func (db *database) queryLicenseAbstractNormalized(normalizedModerate string) ma
 	}
 	for _, keyint := range found {
 		key := keyint.(string)
-		licenseText := db.licenseTexts[key]
-		yourRunes := make([]rune, 0, len(licenseText)/6)
-		vocabulary := map[string]int{}
-		for _, line := range strings.Split(licenseText, "\n") {
-			for _, token := range strings.Split(line, " ") {
-				index, exists := vocabulary[token]
-				if !exists {
-					index = len(vocabulary)
-					vocabulary[token] = index
-				}
-				yourRunes = append(yourRunes, rune(index))
+		candidates[key] = db.scoreLicenseText(normalizedModerate, db.licenseTexts[key])
+		if terms := db.licenseTextsWithoutApplicationGuide[key]; terms != "" {
+			if score := db.scoreLicenseText(normalizedModerate, terms); score > candidates[key] {
+				candidates[key] = score
 			}
 		}
-
-		oovRune := rune(len(vocabulary))
-		myRunes := make([]rune, 0, len(normalizedModerate)/6)
-		for _, line := range strings.Split(normalizedModerate, "\n") {
-			for _, token := range strings.Split(line, " ") {
-				if index, exists := vocabulary[token]; exists {
-					myRunes = append(myRunes, rune(index))
-				} else if len(myRunes) == 0 || myRunes[len(myRunes)-1] != oovRune {
-					myRunes = append(myRunes, oovRune)
-				}
-			}
-		}
-
-		dmp := diffmatchpatch.New()
-		diff := dmp.DiffMainRunes(myRunes, yourRunes, false)
-
-		if db.debug {
-			tokarr := make([]string, len(db.tokens)+1)
-			for key, val := range vocabulary {
-				tokarr[val] = key
-			}
-			tokarr[len(db.tokens)] = "!"
-			println(dmp.DiffPrettyText(dmp.DiffCharsToLines(diff, tokarr)))
-		}
-		distance := dmp.DiffLevenshtein(diff)
-		candidates[key] = float32(1) - float32(distance)/float32(len(myRunes))
 	}
 	weak := make([]string, 0, len(candidates))
 	for key, val := range candidates {
@@ -426,6 +399,64 @@ func (db *database) queryLicenseAbstractNormalized(normalizedModerate string) ma
 		}
 	}
 	return candidates
+}
+
+// gpl2WithoutApplicationGuide supplies an alternative reference, preserving the
+// complete reference for queries that include the guide. Only trusted GPLv2
+// reference texts are shortened; queried license text is never truncated.
+func gpl2WithoutApplicationGuide(id, text string) string {
+	switch strings.TrimPrefix(id, "deprecated_") {
+	case "GPL-2.0", "GPL-2.0+", "GPL-2.0-only", "GPL-2.0-or-later":
+	default:
+		return ""
+	}
+	guide := strings.Index(text, "\nhow to apply these terms to your new programs\n")
+	if guide < 0 {
+		return ""
+	}
+	terms := strings.TrimSpace(text[:guide])
+	return strings.TrimSpace(strings.TrimSuffix(terms, "end of terms and conditions"))
+}
+
+func (db *database) scoreLicenseText(normalizedModerate, licenseText string) float32 {
+	yourRunes := make([]rune, 0, len(licenseText)/6)
+	vocabulary := map[string]int{}
+	for _, line := range strings.Split(licenseText, "\n") {
+		for _, token := range strings.Split(line, " ") {
+			index, exists := vocabulary[token]
+			if !exists {
+				index = len(vocabulary)
+				vocabulary[token] = index
+			}
+			yourRunes = append(yourRunes, rune(index))
+		}
+	}
+
+	oovRune := rune(len(vocabulary))
+	myRunes := make([]rune, 0, len(normalizedModerate)/6)
+	for _, line := range strings.Split(normalizedModerate, "\n") {
+		for _, token := range strings.Split(line, " ") {
+			if index, exists := vocabulary[token]; exists {
+				myRunes = append(myRunes, rune(index))
+			} else if len(myRunes) == 0 || myRunes[len(myRunes)-1] != oovRune {
+				myRunes = append(myRunes, oovRune)
+			}
+		}
+	}
+
+	dmp := diffmatchpatch.New()
+	diff := dmp.DiffMainRunes(myRunes, yourRunes, false)
+
+	if db.debug {
+		tokarr := make([]string, len(db.tokens)+1)
+		for key, val := range vocabulary {
+			tokarr[val] = key
+		}
+		tokarr[len(db.tokens)] = "!"
+		println(dmp.DiffPrettyText(dmp.DiffCharsToLines(diff, tokarr)))
+	}
+	distance := dmp.DiffLevenshtein(diff)
+	return float32(1) - float32(distance)/float32(len(myRunes))
 }
 
 func (db *database) scanForURLs(text string) map[string]bool {
